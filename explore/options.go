@@ -147,11 +147,15 @@ func (o *Options) Complete(f cmdutil.Factory, args []string) error {
 
 	if gvar, ok := gvarMap[o.inputFieldPath]; ok {
 		o.inputFieldPathRegex = regexp.MustCompile(".*")
-		o.gvrs = []schema.GroupVersionResource{gvar.GroupVersionResource}
+		selectedResource, err := o.disambiguateResource(gvar, o.inputFieldPath)
+		if err != nil {
+			return err
+		}
+		o.gvrs = []schema.GroupVersionResource{selectedResource.GroupVersionResource}
 		return nil
 	}
 
-	var gvar *groupVersionAPIResource
+	var gvar []*groupVersionAPIResource
 	var resourceIdx int
 	for i := len(o.inputFieldPath); i > 0; i-- {
 		var ok bool
@@ -168,19 +172,25 @@ func (o *Options) Complete(f cmdutil.Factory, args []string) error {
 		return nil
 	}
 	// Overwrite the regex if the inputFieldPath contains a valid resource name.
-	_, ok := gvarMap[o.inputFieldPath[:resourceIdx]]
+	resources, ok := gvarMap[o.inputFieldPath[:resourceIdx]]
 	if !ok {
 		return fmt.Errorf("no resource found for %s", o.inputFieldPath)
 	}
+
+	selectedResource, err := o.disambiguateResource(resources, o.inputFieldPath[:resourceIdx])
+	if err != nil {
+		return err
+	}
+
 	var re string
-	if strings.HasPrefix(o.inputFieldPath, gvar.Resource) {
-		re = strings.TrimPrefix(o.inputFieldPath, gvar.Resource)
-	} else if strings.HasPrefix(o.inputFieldPath, gvar.Kind) {
-		re = strings.TrimPrefix(o.inputFieldPath, gvar.Kind)
-	} else if strings.HasPrefix(o.inputFieldPath, gvar.SingularName) {
-		re = strings.TrimPrefix(o.inputFieldPath, gvar.SingularName)
+	if strings.HasPrefix(o.inputFieldPath, selectedResource.Resource) {
+		re = strings.TrimPrefix(o.inputFieldPath, selectedResource.Resource)
+	} else if strings.HasPrefix(o.inputFieldPath, selectedResource.Kind) {
+		re = strings.TrimPrefix(o.inputFieldPath, selectedResource.Kind)
+	} else if strings.HasPrefix(o.inputFieldPath, selectedResource.SingularName) {
+		re = strings.TrimPrefix(o.inputFieldPath, selectedResource.SingularName)
 	} else {
-		for _, shortName := range gvar.ShortNames {
+		for _, shortName := range selectedResource.ShortNames {
 			if strings.HasPrefix(o.inputFieldPath, shortName) {
 				re = strings.TrimPrefix(o.inputFieldPath, shortName)
 			}
@@ -193,7 +203,7 @@ func (o *Options) Complete(f cmdutil.Factory, args []string) error {
 	if err != nil {
 		return err
 	}
-	o.gvrs = []schema.GroupVersionResource{gvar.GroupVersionResource}
+	o.gvrs = []schema.GroupVersionResource{selectedResource.GroupVersionResource}
 
 	return nil
 }
@@ -378,13 +388,13 @@ type groupVersionAPIResource struct {
 	metav1.APIResource
 }
 
-func (o *Options) discover() (map[string]*groupVersionAPIResource, []schema.GroupVersionResource, error) {
+func (o *Options) discover() (map[string][]*groupVersionAPIResource, []schema.GroupVersionResource, error) {
 	lists, err := o.apiResourceLists()
 	if err != nil {
 		return nil, nil, err
 	}
 	var gvrs []schema.GroupVersionResource
-	m := make(map[string]*groupVersionAPIResource)
+	m := make(map[string][]*groupVersionAPIResource)
 	for _, list := range lists {
 		if len(list.APIResources) == 0 {
 			continue
@@ -400,11 +410,13 @@ func (o *Options) discover() (map[string]*groupVersionAPIResource, []schema.Grou
 				GroupVersionResource: gvr,
 				APIResource:          resource,
 			}
-			m[resource.Name] = &r
-			m[resource.Kind] = &r
-			m[resource.SingularName] = &r
+			m[resource.Name] = append(m[resource.Name], &r)
+			m[resource.Kind] = append(m[resource.Kind], &r)
+			if resource.SingularName != "" {
+				m[resource.SingularName] = append(m[resource.SingularName], &r)
+			}
 			for _, shortName := range resource.ShortNames {
-				m[shortName] = &r
+				m[shortName] = append(m[shortName], &r)
 			}
 		}
 	}
@@ -412,4 +424,80 @@ func (o *Options) discover() (map[string]*groupVersionAPIResource, []schema.Grou
 		return gvrs[i].String() < gvrs[j].String()
 	})
 	return m, gvrs, nil
+}
+
+// disambiguateResource prompts the user to select a resource when multiple resources
+// with the same name exist across different API groups.
+func (o *Options) disambiguateResource(resources []*groupVersionAPIResource, resourceName string) (*groupVersionAPIResource, error) {
+	if len(resources) == 0 {
+		return nil, fmt.Errorf("no resources found for %s", resourceName)
+	}
+	if len(resources) == 1 {
+		return resources[0], nil
+	}
+
+	// Check if all resources are from different groups
+	groupMap := make(map[string]*groupVersionAPIResource)
+	for _, r := range resources {
+		key := r.GroupVersionResource.Group + "/" + r.GroupVersionResource.Version
+		if existing, ok := groupMap[key]; ok {
+			// If same group/version exists, prefer the latest version (already sorted)
+			// This maintains the existing behavior for same-group resources
+			if r.GroupVersionResource.Version >= existing.GroupVersionResource.Version {
+				groupMap[key] = r
+			}
+		} else {
+			groupMap[key] = r
+		}
+	}
+
+	// If only one unique group remains, return it
+	if len(groupMap) == 1 {
+		for _, r := range groupMap {
+			return r, nil
+		}
+	}
+
+	// Multiple groups found - prompt user to disambiguate
+	uniqueResources := make([]*groupVersionAPIResource, 0, len(groupMap))
+	for _, r := range groupMap {
+		uniqueResources = append(uniqueResources, r)
+	}
+
+	// Sort by group/version for consistent display
+	sort.SliceStable(uniqueResources, func(i, j int) bool {
+		return uniqueResources[i].GroupVersionResource.String() < uniqueResources[j].GroupVersionResource.String()
+	})
+
+	idx, err := fuzzyfinder.Find(
+		uniqueResources,
+		func(i int) string {
+			r := uniqueResources[i]
+			if r.GroupVersionResource.Group == "" {
+				return fmt.Sprintf("%s (core/%s)", r.APIResource.Kind, r.GroupVersionResource.Version)
+			}
+			return fmt.Sprintf("%s (%s/%s)", r.APIResource.Kind, r.GroupVersionResource.Group, r.GroupVersionResource.Version)
+		},
+		fuzzyfinder.WithPreviewWindow(func(i, _, _ int) string {
+			if i < 0 {
+				return ""
+			}
+			r := uniqueResources[i]
+			preview := fmt.Sprintf("Resource: %s\n", r.APIResource.Name)
+			preview += fmt.Sprintf("Kind: %s\n", r.APIResource.Kind)
+			preview += fmt.Sprintf("Group: %s\n", r.GroupVersionResource.Group)
+			preview += fmt.Sprintf("Version: %s\n", r.GroupVersionResource.Version)
+			preview += fmt.Sprintf("Namespaced: %t\n", r.APIResource.Namespaced)
+			if len(r.APIResource.ShortNames) > 0 {
+				preview += fmt.Sprintf("Short Names: %s\n", strings.Join(r.APIResource.ShortNames, ", "))
+			}
+			preview += fmt.Sprintf("\nFull GVR: %s", r.GroupVersionResource.String())
+			return preview
+		}),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("fuzzy find the API resource: %w", err)
+	}
+
+	return uniqueResources[idx], nil
 }
